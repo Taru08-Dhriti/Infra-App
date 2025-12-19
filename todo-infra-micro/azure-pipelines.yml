@@ -1,0 +1,105 @@
+trigger:
+  - main
+  - feature/*
+
+pool:
+  vmImage: ubuntu-latest
+
+parameters:
+  - name: environment
+    displayName: Deployment Environment
+    type: string
+    default: dev
+    values:
+      - dev
+      - preprod
+      - prod
+
+variables:
+  terraformWorkingDir: '$(System.DefaultWorkingDirectory)/environment/${{ parameters.environment }}'
+
+stages:
+- stage: Terraform_Plan
+  displayName: Terraform Init, Validate & Plan
+  jobs:
+  - job: terraform_plan
+    displayName: Terraform Plan Job
+    steps:
+    - task: TerraformTask@5
+      displayName: Terraform Init
+      inputs:
+        provider: azurerm
+        command: init
+        workingDirectory: $(terraformWorkingDir)
+        backendServiceArm: sc-terraform-backend
+        backendAzureRmStorageAccountName: mstatefiles
+        backendAzureRmContainerName: statefiles
+        backendAzureRmKey: ${{ parameters.environment }}.tfstate
+
+    - task: TerraformTask@5
+      displayName: Terraform Validate
+      inputs:
+        provider: azurerm
+        command: validate
+        workingDirectory: $(terraformWorkingDir)
+
+    - task: TerraformTask@5
+      displayName: Terraform Plan
+      inputs:
+        provider: azurerm
+        command: plan
+        workingDirectory: $(terraformWorkingDir)
+        environmentServiceNameAzureRM: sc-terraform-deploy
+
+- stage: Security_Scans
+  displayName: Terraform Security Scans
+  dependsOn: Terraform_Plan
+  jobs:
+  - job: tfsec_scan
+    displayName: tfsec Scan
+    steps:
+    - task: tfsec@1
+      displayName: Run tfsec
+      inputs:
+        dir: $(terraformWorkingDir)
+
+  - job: tflint_scan
+    displayName: tflint Scan
+    steps:
+    - script: |
+        tflint $(terraformWorkingDir) --recursive -f junit > tflint-report.xml
+      continueOnError: true
+
+    - task: PublishTestResults@2
+      displayName: Publish tflint Results
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: tflint-report.xml
+
+
+- stage: Terraform_Apply
+  displayName: Terraform Apply
+  dependsOn: Security_Scans
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: manual_approval
+    displayName: Manual Approval
+    pool: server
+    steps:
+    - task: ManualValidation@1
+      displayName: Await Approval
+      inputs:
+        notifyUsers: achinta.dutta04@gmail.com
+        instructions: "Please approve Terraform apply for ${{ parameters.environment }} environment"
+
+  - job: terraform_apply
+    displayName: Terraform Apply Job
+    dependsOn: manual_approval
+    steps:
+    - task: TerraformTask@5
+      displayName: Terraform Apply
+      inputs:
+        provider: azurerm
+        command: apply
+        workingDirectory: $(terraformWorkingDir)
+        environmentServiceNameAzureRM: sc-terraform-deploy
